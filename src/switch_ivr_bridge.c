@@ -234,6 +234,20 @@ struct switch_ivr_bridge_data {
 };
 typedef struct switch_ivr_bridge_data switch_ivr_bridge_data_t;
 
+struct ringback {
+	switch_buffer_t *audio_buffer;
+	teletone_generation_session_t ts;
+	switch_file_handle_t fhb;
+	switch_file_handle_t *fh;
+	int silence;
+	uint8_t asis;
+	int channels;
+	void *mux_buf;
+	int mux_buflen;
+};
+
+typedef struct ringback ringback_t;
+
 static void *audio_bridge_thread(switch_thread_t *thread, void *obj)
 {
 	switch_ivr_bridge_data_t *data = obj;
@@ -265,6 +279,12 @@ static void *audio_bridge_thread(switch_thread_t *thread, void *obj)
 	struct vid_helper vh = { 0 };
 	uint32_t vid_launch = 0;
 #endif
+
+	const char *fake_ringback_data = NULL;
+	ringback_t ringback = { 0 };
+	switch_frame_t fake_frame = { 0 };
+	switch_codec_t fake_codec = {0};
+
 	data->clean_exit = 0;
 
 	session_a = data->session;
@@ -379,6 +399,41 @@ static void *audio_bridge_thread(switch_thread_t *thread, void *obj)
 				silence_frame.buflen = sizeof(silence_data);
 				silence_frame.datalen = read_impl.decoded_bytes_per_packet;
 				silence_frame.samples = silence_frame.datalen / sizeof(int16_t);
+			}
+		}
+	}
+
+	fake_ringback_data = switch_channel_get_variable(chan_a, "fake_ringback");
+	if (!zstr(fake_ringback_data) && switch_is_file_path(fake_ringback_data)) {
+		if (switch_core_file_open(&ringback.fhb,
+											  fake_ringback_data,
+											  read_impl.number_of_channels,
+											  read_impl.actual_samples_per_second,
+											  SWITCH_FILE_FLAG_READ | SWITCH_FILE_DATA_SHORT, NULL) != SWITCH_STATUS_SUCCESS) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session_a), SWITCH_LOG_ERROR, "Error fake ringback File\n");
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session_a), SWITCH_LOG_DEBUG, "fake ringback File %s\n", fake_ringback_data);
+			ringback.fh = &ringback.fhb;
+			if (switch_core_codec_init(&fake_codec,
+									   "L16",
+									   NULL,
+									   NULL,
+									   read_impl.actual_samples_per_second,
+									   read_impl.microseconds_per_packet / 1000,
+									   read_impl.number_of_channels,
+									   SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+									   NULL, switch_core_session_get_pool(session_a)) != SWITCH_STATUS_SUCCESS) {
+				switch_core_file_close(ringback.fh);
+				ringback.fh = NULL;
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session_a), SWITCH_LOG_DEBUG, "Setup fake ringback from %s to %s\n", switch_channel_get_name(chan_a),
+								  switch_channel_get_name(chan_b));
+				fake_frame.codec = &fake_codec;
+				fake_frame.datalen = read_impl.decoded_bytes_per_packet;
+				fake_frame.samples = fake_frame.datalen / sizeof(int16_t);
+				switch_zmalloc(fake_frame.data, SWITCH_RECOMMENDED_BUFFER_SIZE);
+				fake_frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+				memset(fake_frame.data, 255, fake_frame.datalen);
 			}
 		}
 	}
@@ -659,9 +714,29 @@ static void *audio_bridge_thread(switch_thread_t *thread, void *obj)
 					switch_generate_sln_silence((int16_t *) silence_frame.data, silence_frame.samples, 
 												read_impl.number_of_channels, silence_val);
 					read_frame = &silence_frame;
+				} else if (switch_channel_get_variable(chan_a, "fake_ringing") && ringback.fh) {
+					switch_size_t mlen, olen;
+					unsigned int pos = 0;
+
+					mlen = fake_frame.codec->implementation->samples_per_packet;
+					olen = mlen;
+					switch_core_file_read(ringback.fh, fake_frame.data, &olen);
+
+					if (olen == 0) {
+						olen = mlen;
+						ringback.fh->speed = 0;
+						switch_core_file_seek(ringback.fh, &pos, 0, SEEK_SET);
+						switch_core_file_read(ringback.fh, fake_frame.data, &olen);
+					}
+
+					fake_frame.datalen = (uint32_t) (olen * 2 * ringback.fh->channels);
+
+					if (olen > 0) read_frame = &fake_frame;
 				} else if (!switch_channel_test_flag(chan_b, CF_ACCEPT_CNG)) {
 					continue;
 				}
+			} else {
+				switch_channel_set_variable(chan_a, "fake_ringing", NULL);
 			}
 
 			if (switch_channel_test_flag(chan_a, CF_BRIDGE_NOWRITE)) {
@@ -788,6 +863,13 @@ static void *audio_bridge_thread(switch_thread_t *thread, void *obj)
 	switch_core_session_video_reset(session_b);
 
 	switch_core_session_rwunlock(session_b);
+
+	if (ringback.fh) {
+		switch_core_file_close(ringback.fh);
+		ringback.fh = NULL;
+	}
+	switch_safe_free(fake_frame.data);
+	
 	return NULL;
 }
 

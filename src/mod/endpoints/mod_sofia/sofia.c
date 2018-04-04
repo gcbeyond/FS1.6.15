@@ -6206,6 +6206,12 @@ static void sofia_handle_sip_r_invite(switch_core_session_t *session, int status
 
 		switch_channel_clear_flag(channel, CF_REQ_MEDIA);
 
+		if (status == 180 && switch_channel_get_state(channel) == CS_EXCHANGE_MEDIA) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG1, "already exchange media, ingore 180\n");
+			switch_channel_add_variable_var_check(channel, "fake_ringing", "true", SWITCH_FALSE, SWITCH_STACK_PUSH);
+			return;
+		}
+
 		if (status < 200) {
 			if (switch_core_session_get_partner(session, &other_session) == SWITCH_STATUS_SUCCESS) {
 				if(switch_core_session_compare(session, other_session)) {
